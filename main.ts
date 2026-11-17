@@ -101,6 +101,30 @@ function emaUpdate(prev: number | null, value: number, n: number): number {
   return value * k + prev * (1 - k);
 }
 
+/** The bounce confirmation: an up close, off the recent low. */
+function bounceConfirmed(close: number, prevClose: number, windowLow: number): boolean {
+  return close > prevClose && close >= windowLow * (1 + BOUNCE);
+}
+
+/** The lowest low of the last LOW_K bars, current bar included. */
+function recentLow(): number {
+  let windowLow = Infinity;
+  for (let i = Math.max(0, lows.length - LOW_K); i < lows.length; i++) {
+    if (lows[i]! < windowLow) windowLow = lows[i]!;
+  }
+  return windowLow;
+}
+
+/**
+ * The expected round-trip cost as a fraction, from the fee and slippage the
+ * harness charges plus constant-product impact against the latest close
+ * depth, for a trade of `size` quote units. Mirrors the replay's fill math:
+ * each leg pays its fee, its slippage, and 1 + size/depth of price impact.
+ */
+function expectedRoundTripCost(size: number, depth: bigint, feeBps: number, slippageBps: number): number {
+  return (2 * feeBps) / 10000 + (2 * slippageBps) / 10000 + (2 * size) / Number(depth);
+}
+
 await runBars({
   onBatch(state: BarsState, batch: Batch): OrderInput[] {
     // Fold fills in first: they decide the entry price, the hold clock, and
@@ -183,21 +207,14 @@ await runBars({
 
     // Bounce confirmation: an up close, off the recent low.
     const prevClose = closes[closes.length - 2]!;
-    let windowLow = Infinity;
-    for (let i = Math.max(0, lows.length - LOW_K); i < lows.length; i++) {
-      if (lows[i]! < windowLow) windowLow = lows[i]!;
-    }
-    if (!(close > prevClose && close >= windowLow * (1 + BOUNCE))) return [];
+    if (!bounceConfirmed(close, prevClose, recentLow())) return [];
 
     // Impact-aware entry: the target must cover the expected round trip.
     const depth = state.depthAt(SYMBOL);
     if (depth === null || depth[0] === 0n) return [];
     const size = Number(state.cash);
     const { fee_bps, slippage_bps, min_notional_quote_units } = state.hello.fees;
-    const expectedCost =
-      (2 * fee_bps) / 10000 +
-      (2 * slippage_bps) / 10000 +
-      (2 * size) / Number(depth[0]);
+    const expectedCost = expectedRoundTripCost(size, depth[0], fee_bps, slippage_bps);
     if (TAKE_PROFIT < expectedCost + COST_BUFFER) return [];
 
     const room = state.weightRoom(SYMBOL);
